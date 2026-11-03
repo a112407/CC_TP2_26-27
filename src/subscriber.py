@@ -1,4 +1,4 @@
-import socket, threading, time
+import socket, sys, threading, time
 import wire
 from logutil import DeliveryLog
 
@@ -17,7 +17,10 @@ def run_subscriber(cfg, ident):
     m = rdr.read()
     if m is None or m[0] != wire.T_WELCOME:
         raise SystemExit("sessão recusada")
-    wire.dec_welcome(m[2])
+    data_port, _ = wire.dec_welcome(m[2])
+    # Destino dos ACKs EventCast (fase 2). Têm de sair do mesmo socket 'udp',
+    # cuja porta o broker guardou no HELLO.
+    broker_data = (host, data_port)
 
     stop = threading.Event()
 
@@ -32,18 +35,40 @@ def run_subscriber(cfg, ident):
             if d is None:
                 continue
             qos, _, mid, topic, _ = d
-            # fase 3: se qos == 2, consultar tabela de duplicados aqui
+            # fase 3: se qos == 2, consultar tabela de duplicados aqui,
+            # com chave (topic, mid): o mid sozinho colide entre fluxos.
             log.write(topic, mid)
 
     threading.Thread(target=recv_loop, daemon=True).start()
 
+    session_ok = True   # passa a False se o broker fechar a sessão (ex.: expulsão)
+
+    def control(frame, what):
+        """Pedido SubControl com resposta. Devolve True se aceite. Se a sessão
+        caiu, deixa de tentar (o registo e a receção continuam até 'duration')."""
+        nonlocal session_ok
+        if not session_ok:
+            return False
+        try:
+            tcp.sendall(frame)
+            r = rdr.read()
+        except OSError:        # BrokenPipeError, ConnectionResetError, ...
+            r = None
+        if r is None:
+            session_ok = False
+            print("[subscriber %s] sessão fechada pelo broker (%s)" % (ident, what),
+                  file=sys.stderr, flush=True)
+            return False
+        if r[0] != wire.T_ACK or r[2][0] != 0:
+            print("[subscriber %s] recusado: %s" % (ident, what), file=sys.stderr, flush=True)
+            return False
+        return True
+
     def subscribe(flt, qos):
-        tcp.sendall(wire.enc_sub(flt, qos))
-        rdr.read()  # SUBACK
+        control(wire.enc_sub(flt, qos), "subscribe " + flt)
 
     def unsubscribe(flt):
-        tcp.sendall(wire.enc_unsub(flt))
-        rdr.read()
+        control(wire.enc_unsub(flt), "unsubscribe " + flt)
 
     for flt, o in cfg.all("subscribe"):
         subscribe(flt, int(o["qos"]))

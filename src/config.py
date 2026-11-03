@@ -1,6 +1,7 @@
 """Parser do ficheiro de configuração: 'chave = valor  # comentário'.
 Valor = primeiro termo + opções nome=valor. Sem valores por omissão."""
 
+
 class Config:
     def __init__(self, path):
         self.items = {}  # chave -> lista de (termo, {opcoes}) pela ordem de aparição
