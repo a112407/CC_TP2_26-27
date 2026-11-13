@@ -34,7 +34,11 @@ def run_subscriber(cfg, ident):
             d = wire.dec_data(data)
             if d is None:
                 continue
-            qos, _, mid, topic, _ = d
+            qos, tx, mid, topic, _ = d
+            try:
+                udp.sendto(wire.enc_udp_ack(tx), broker_data)
+            except OSError:
+                pass
             # fase 3: se qos == 2, consultar tabela de duplicados aqui,
             # com chave (topic, mid): o mid sozinho colide entre fluxos.
             log.write(topic, mid)

@@ -10,6 +10,7 @@ class Broker:
         self.control_port = cfg.get_int("control_port")
         self.data_port = cfg.get_int("data_port")
         self.duration = cfg.get_float("duration")
+        self.evict_after = cfg.get_float("evict_after")
         self.lock = threading.Lock()
         # Tabela 1 do desenho: filtro -> {session_id: qos}  ("Tópico | Inscritos")
         self.table = {}
@@ -28,6 +29,7 @@ class Broker:
         self.by_addr = {}   # (ip, porta UDP) -> session_id
         self.next_session = 1
         self.stop = threading.Event()
+        self.retransmit = {}  # dest -> {tx_seq: {"pkt": pacote, "last": ts}}
 
     def warn(self, msg):
         print("[broker %s] %s" % (self.ident, msg), file=sys.stderr, flush=True)
@@ -42,6 +44,8 @@ class Broker:
         self.udp.bind((self.bind, self.data_port))
         self.udp.settimeout(0.2)
         threading.Thread(target=self.accept_loop, daemon=True).start()
+        threading.Thread(target=self.retransmit_loop, daemon=True).start()
+        threading.Thread(target=self.evict_loop, daemon=True).start()
         deadline = time.time() + self.duration
         try:
             while time.time() < deadline:
@@ -52,9 +56,11 @@ class Broker:
                 except OSError:
                     time.sleep(0.01)
                     continue
-                # Nada que venha da rede pode matar a thread de dados: um
-                # datagrama mau é descartado, o broker continua.
                 try:
+                    ack = wire.dec_udp_ack(data)
+                    if ack is not None:
+                        self.on_udp_ack(addr, ack)
+                        continue
                     self.on_data(data, addr)
                 except Exception as e:
                     self.warn("on_data: %r" % (e,))
@@ -90,7 +96,7 @@ class Broker:
             with self.lock:
                 sid = self.next_session
                 self.next_session += 1
-                st = {"addr": udp_addr, "tx": 0, "id": cid, "conn": conn}
+                st = {"addr": udp_addr, "tx": 0, "id": cid, "conn": conn, "last_seen": time.time()}
                 (self.subs if role == wire.ROLE_SUB else self.pubs)[sid] = st
                 self.by_addr[udp_addr] = sid
             conn.sendall(wire.enc_welcome(self.data_port, sid))
@@ -146,6 +152,23 @@ class Broker:
             if not inscritos:
                 del self.table[flt]
 
+    def _evict_subscriber(self, sid):  # chamar com o lock
+        st = self.subs.get(sid)
+        if st is None:
+            return
+        udp_addr = st["addr"]
+        for f in list(self.table):
+            self._drop(f, sid)
+        self._refresh()
+        self.subs.pop(sid, None)
+        if self.by_addr.get(udp_addr) == sid:
+            del self.by_addr[udp_addr]
+        self.retransmit.pop(udp_addr, None)
+        try:
+            st["conn"].close()
+        except OSError:
+            pass
+
     def _resolve(self, topic):  # chamar com o lock
         """Subscritores que cobrem um tópico concreto: 3 consultas à tabela 1;
         com filtros sobrepostos fica o qos mais forte."""
@@ -164,14 +187,50 @@ class Broker:
                 info["subs"] = self._resolve(t)
 
     # ---------- plano de dados ----------
+    def retransmit_loop(self):
+        while not self.stop.is_set():
+            now = time.time()
+            for dest, pending in list(self.retransmit.items()):
+                for tx_seq, state in list(pending.items()):
+                    if now - state["last"] >= 0.25:
+                        try:
+                            self.udp.sendto(state["pkt"], dest)
+                        except OSError:
+                            pass
+                        state["last"] = now
+            time.sleep(0.05)
+
+    def evict_loop(self):
+        while not self.stop.is_set():
+            now = time.time()
+            with self.lock:
+                expired = [sid for sid, s in self.subs.items()
+                           if now - s.get("last_seen", now) >= self.evict_after]
+                for sid in expired:
+                    self._evict_subscriber(sid)
+            time.sleep(0.1)
+
+    def on_udp_ack(self, addr, tx_seq):
+        with self.lock:
+            sid = self.by_addr.get(addr)
+            if sid in self.subs:
+                self.subs[sid]["last_seen"] = time.time()
+            for dest, pending in list(self.retransmit.items()):
+                if dest == addr:
+                    pending.pop(tx_seq, None)
+                    if not pending:
+                        del self.retransmit[dest]
+
     def on_data(self, data, addr):
         d = wire.dec_data(data)
         if d is None or not valid_topic(d[3]):
             return  # truncado / desconhecido / tópico inválido: descarta
-        _, _, msg_id, topic, content = d
+        _, tx_seq, msg_id, topic, content = d
         with self.lock:
-            if self.by_addr.get(addr) not in self.pubs:
+            sid_pub = self.by_addr.get(addr)
+            if sid_pub not in self.pubs:
                 return  # origem sem sessão de publicador: descarta
+            self.pubs[sid_pub]["last_seen"] = time.time()
             info = self.topics.get(topic)
             if info is None:
                 return  # fluxo não registado (REG): descarta
@@ -182,10 +241,16 @@ class Broker:
                 if s is None:
                     continue
                 s["tx"] = wire.seq_next(s["tx"])    # tx_seq por subscritor, com volta
-                targets.append((s["addr"], min(q, qos_flow), s["tx"]))
-        for dest, qos, tx in targets:
+                pkt = wire.enc_data(min(q, qos_flow), s["tx"], msg_id, topic, content)
+                self.retransmit.setdefault(s["addr"], {})[s["tx"]] = {"pkt": pkt, "last": time.time()}
+                targets.append((s["addr"], min(q, qos_flow), s["tx"], pkt))
+        try:
+            self.udp.sendto(wire.enc_udp_ack(tx_seq), addr)
+        except OSError:
+            pass
+        for dest, qos, tx, pkt in targets:
             try:
-                self.udp.sendto(wire.enc_data(qos, tx, msg_id, topic, content), dest)
+                self.udp.sendto(pkt, dest)
             except OSError as e:
                 # ex.: rede inalcançável. Um destino em falha não afeta os
                 # outros; na fase 2 a retransmissão volta a tentar.
