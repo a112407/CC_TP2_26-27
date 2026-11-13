@@ -3,10 +3,14 @@ import wire
 from logutil import DeliveryLog
 
 
+LINGER = 0.5   # s, espera antes do BYE (ver abaixo)
+
+
 def run_publisher(cfg, ident):
     host, port = cfg.get_addr("broker_control")
     log = DeliveryLog(cfg.get("log"), ident)
     start_after = cfg.get_float("start_after")
+    drain = cfg.get_float("drain")
 
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind(("0.0.0.0", 0))
@@ -42,14 +46,22 @@ def run_publisher(cfg, ident):
         if wait > 0:
             time.sleep(wait)
         tx = wire.seq_next(tx)
+        # Regista ANTES de enviar: o instante de publicação nunca é posterior ao
+        # de qualquer entrega (o relógio é em ms; registar depois do sendto deixa
+        # o subscritor, noutro processo, registar a entrega 1 ms antes).
+        log.write(topic, mid)
         try:
             udp.sendto(wire.enc_data(qos, tx, mid, topic, b"synthetic"), broker_data)
         except OSError as e:
             # A publicação existe (fica no registo); na fase 2 a retransmissão
             # volta a enviá-la. Aqui só não deixamos o processo morrer.
             print("[publisher %s] sendto: %r" % (ident, e), file=sys.stderr, flush=True)
-        log.write(topic, mid)
-    # TODO fase 2: retransmitir até 'drain' segundos / tudo confirmado
+    # Fase 1: sem ACKs não há como saber que o broker já tratou o último datagrama,
+    # e UDP e TCP não têm ordem entre si: um BYE enviado logo a seguir pode ser
+    # tratado ANTES do último DATA, e o broker (só aceita DATA de publicadores com
+    # sessão) descartá-lo-ia. Espera-se um pouco. Fase 2: ACKs + retransmissão até
+    # 'drain' substituem esta espera.
+    time.sleep(min(drain, LINGER))
     try:
         tcp.sendall(wire.enc_frame(wire.T_BYE))
     except OSError:
