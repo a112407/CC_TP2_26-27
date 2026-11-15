@@ -12,6 +12,7 @@ def run_subscriber(cfg, ident):
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind(("0.0.0.0", 0))
     tcp = socket.create_connection((host, port))
+    tcp.settimeout(1.0)
     rdr = wire.FrameReader(tcp)
     tcp.sendall(wire.enc_hello(wire.ROLE_SUB, udp.getsockname()[1], ident))
     m = rdr.read()

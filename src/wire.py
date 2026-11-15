@@ -11,20 +11,19 @@ EventCast (UDP):
     DATA (tipo 1): | tipo 1B | qos 1B | tx_seq 4B | msg_id 4B | topic_len 1B | topico | dados |
     ACK  (tipo 2): | tipo 1B | tx_seq 4B |          (reservado; mecanismo na fase 2)
 
-    tx_seq: número de sequência POR EMISSOR E POR SALTO (32 bits, 0 reservado
-    para 'sem número'; dá a volta, ver seq_next/seq_lt). msg_id: ponta a ponta.
+    tx_seq: número de sequência POR EMISSOR E POR SALTO (32 bits, sem valor
+    reservado; dá a volta, ver seq_next/seq_lt). msg_id: ponta a ponta.
 """
 
 # ---- Números de sequência de 32 bits (aritmética modular) ----
 SEQ_MOD = 1 << 32
 SEQ_MASK = SEQ_MOD - 1
+RTO = 0.25
 
 
 def seq_next(n):
-    """Próximo número de sequência. Dá a volta aos 2**32 e salta o 0, que fica
-    reservado para 'sem número' (ex.: valor inicial de um contador)."""
-    n = (n + 1) & SEQ_MASK
-    return n or 1
+    """Próximo número de sequência. Dá a volta aos 2**32 sem reservar o 0."""
+    return (n + 1) & SEQ_MASK
 
 
 def seq_lt(a, b):

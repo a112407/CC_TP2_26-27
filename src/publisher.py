@@ -4,7 +4,7 @@ from logutil import DeliveryLog
 
 
 LINGER = 0.5   # s, espera antes do BYE (ver abaixo)
-ACK_TIMEOUT = 0.25
+ACK_TIMEOUT = wire.RTO
 
 
 def run_publisher(cfg, ident):
@@ -30,6 +30,7 @@ def run_publisher(cfg, ident):
             raise SystemExit("registo recusado: " + topic)
 
     pending = {}
+    lock = threading.Lock()
     stop = threading.Event()
 
     def ack_loop():
@@ -42,30 +43,42 @@ def run_publisher(cfg, ident):
             ack = wire.dec_udp_ack(data)
             if ack is None:
                 continue
-            pending.pop(ack, None)
+            with lock:
+                pending.pop(ack, None)
 
     def resend_loop():
         while not stop.is_set():
             now = time.time()
-            for tx_seq, state in list(pending.items()):
-                if now - state["last"] >= ACK_TIMEOUT:
+            with lock:
+                due = [(tx_seq, state) for tx_seq, state in pending.items()
+                       if now - state["last"] >= ACK_TIMEOUT]
+            for tx_seq, state in due:
+                try:
                     udp.sendto(state["pkt"], broker_data)
-                    state["last"] = now
+                except OSError:
+                    pass
+                with lock:
+                    if tx_seq in pending and pending[tx_seq] is state:
+                        state["last"] = now
             time.sleep(0.05)
 
-    threading.Thread(target=ack_loop, daemon=True).start()
-    threading.Thread(target=resend_loop, daemon=True).start()
+    threads = [
+        threading.Thread(target=ack_loop, daemon=True),
+        threading.Thread(target=resend_loop, daemon=True),
+    ]
+    for t in threads:
+        t.start()
 
     # agenda: (instante relativo, topico, qos, msg_id)
     sched = []
     for topic, o in cfg.all("publish"):
         count, rate, qos = int(o["count"]), float(o["rate"]), int(o["qos"])
-        sched += [(k / rate, topic, qos, k + 1) for k in range(count)]
+        sched += [(k / rate, topic, qos, k) for k in range(count)]
     sched.sort()
 
     # tx_seq: contador do PUBLICADOR (um por salto publicador->broker), comum a
-    # todos os fluxos. É ele que o ACK da fase 2 vai referir; o msg_id não serve
-    # porque cada fluxo começa em 1.
+    # todos os fluxos. O msg_id é o identificador ponta a ponta do fluxo, por isso
+    # começa em 0 para coincidir com a primeira publicação válida.
     tx = 0
     time.sleep(start_after)
     t0 = time.time()
@@ -73,13 +86,14 @@ def run_publisher(cfg, ident):
         wait = t0 + rel - time.time()
         if wait > 0:
             time.sleep(wait)
-        tx = wire.seq_next(tx)
+        seq, tx = tx, wire.seq_next(tx)
         # Regista ANTES de enviar: o instante de publicação nunca é posterior ao
         # de qualquer entrega (o relógio é em ms; registar depois do sendto deixa
         # o subscritor, noutro processo, registar a entrega 1 ms antes).
         log.write(topic, mid)
-        pkt = wire.enc_data(qos, tx, mid, topic, b"synthetic")
-        pending[tx] = {"pkt": pkt, "last": time.time()}
+        pkt = wire.enc_data(qos, seq, mid, topic, b"synthetic")
+        with lock:
+            pending[seq] = {"pkt": pkt, "last": time.time()}
         try:
             udp.sendto(pkt, broker_data)
         except OSError as e:
@@ -87,10 +101,18 @@ def run_publisher(cfg, ident):
             # volta a enviá-la. Aqui só não deixamos o processo morrer.
             print("[publisher %s] sendto: %r" % (ident, e), file=sys.stderr, flush=True)
     # Fase 2: o broker responde com ACK por UDP; se um datagrama não for
-    # confirmado a tempo, o remetente retransmite até o ACK chegar. A espera final
-    # também permite que o último ACK chegue antes do BYE.
-    time.sleep(min(drain, LINGER))
+    # confirmado a tempo, o remetente retransmite até o ACK chegar. O publicador
+    # espera até ao máximo de drain segundos, mas termina antes se tudo estiver
+    # confirmado.
+    deadline = time.time() + drain
+    while time.time() < deadline:
+        with lock:
+            if not pending:
+                break
+        time.sleep(0.02)
     stop.set()
+    for t in threads:
+        t.join(1)
     try:
         tcp.sendall(wire.enc_frame(wire.T_BYE))
     except OSError:

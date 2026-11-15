@@ -30,6 +30,7 @@ class Broker:
         self.next_session = 1
         self.stop = threading.Event()
         self.retransmit = {}  # dest -> {tx_seq: {"pkt": pacote, "last": ts}}
+        self.dup_seen = {}     # (sid_pub, tx_seq) -> ts: deduplicação de DATA retransmitidos
 
     def warn(self, msg):
         print("[broker %s] %s" % (self.ident, msg), file=sys.stderr, flush=True)
@@ -66,6 +67,25 @@ class Broker:
                     self.warn("on_data: %r" % (e,))
         finally:
             self.stop.set()
+            for sock in (getattr(self, "tcp", None), getattr(self, "udp", None)):
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+            for st in list(self.subs.values()):
+                try:
+                    st["conn"].shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    st["conn"].close()
+                except OSError:
+                    pass
 
     # ---------- plano de controlo ----------
     def accept_loop(self):
@@ -138,6 +158,8 @@ class Broker:
                     self._refresh()          # deixa de ser subscritor ativo
                     self.subs.pop(sid, None)
                     self.pubs.pop(sid, None)
+                    if udp_addr is not None:
+                        self.retransmit.pop(udp_addr, None)
                     if self.by_addr.get(udp_addr) == sid:
                         del self.by_addr[udp_addr]
             try:
@@ -165,6 +187,10 @@ class Broker:
             del self.by_addr[udp_addr]
         self.retransmit.pop(udp_addr, None)
         try:
+            st["conn"].shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
             st["conn"].close()
         except OSError:
             pass
@@ -186,18 +212,34 @@ class Broker:
             if flt is None or matches(flt, t):
                 info["subs"] = self._resolve(t)
 
+    def _is_duplicate_pub(self, sid_pub, tx_seq):
+        now = time.time()
+        window = 2 * wire.RTO
+        for key, ts in list(self.dup_seen.items()):
+            if now - ts > window:
+                del self.dup_seen[key]
+        key = (sid_pub, tx_seq)
+        if key in self.dup_seen:
+            return True
+        self.dup_seen[key] = now
+        return False
+
     # ---------- plano de dados ----------
     def retransmit_loop(self):
         while not self.stop.is_set():
             now = time.time()
-            for dest, pending in list(self.retransmit.items()):
-                for tx_seq, state in list(pending.items()):
-                    if now - state["last"] >= 0.25:
-                        try:
-                            self.udp.sendto(state["pkt"], dest)
-                        except OSError:
-                            pass
-                        state["last"] = now
+            due = []
+            with self.lock:
+                for dest, pending in self.retransmit.items():
+                    for tx_seq, state in list(pending.items()):
+                        if now - state["last"] >= wire.RTO:
+                            state["last"] = now
+                            due.append((dest, state["pkt"]))
+            for dest, pkt in due:
+                try:
+                    self.udp.sendto(pkt, dest)
+                except OSError:
+                    pass
             time.sleep(0.05)
 
     def evict_loop(self):
@@ -205,7 +247,8 @@ class Broker:
             now = time.time()
             with self.lock:
                 expired = [sid for sid, s in self.subs.items()
-                           if now - s.get("last_seen", now) >= self.evict_after]
+                           if s["addr"] in self.retransmit
+                           and now - s["last_seen"] >= self.evict_after]
                 for sid in expired:
                     self._evict_subscriber(sid)
             time.sleep(0.1)
@@ -215,11 +258,12 @@ class Broker:
             sid = self.by_addr.get(addr)
             if sid in self.subs:
                 self.subs[sid]["last_seen"] = time.time()
-            for dest, pending in list(self.retransmit.items()):
-                if dest == addr:
-                    pending.pop(tx_seq, None)
-                    if not pending:
-                        del self.retransmit[dest]
+            pending = self.retransmit.get(addr)
+            if pending is None:
+                return
+            pending.pop(tx_seq, None)
+            if not pending:
+                del self.retransmit[addr]
 
     def on_data(self, data, addr):
         d = wire.dec_data(data)
@@ -230,24 +274,31 @@ class Broker:
             sid_pub = self.by_addr.get(addr)
             if sid_pub not in self.pubs:
                 return  # origem sem sessão de publicador: descarta
+            duplicate = self._is_duplicate_pub(sid_pub, tx_seq)
             self.pubs[sid_pub]["last_seen"] = time.time()
             info = self.topics.get(topic)
             if info is None:
                 return  # fluxo não registado (REG): descarta
             qos_flow = info["qos"]
             targets = []
-            for sid, q in info["subs"].items():     # 1 consulta, 1 cópia por subscritor
-                s = self.subs.get(sid)
-                if s is None:
-                    continue
-                s["tx"] = wire.seq_next(s["tx"])    # tx_seq por subscritor, com volta
-                pkt = wire.enc_data(min(q, qos_flow), s["tx"], msg_id, topic, content)
-                self.retransmit.setdefault(s["addr"], {})[s["tx"]] = {"pkt": pkt, "last": time.time()}
-                targets.append((s["addr"], min(q, qos_flow), s["tx"], pkt))
+            if not duplicate:
+                for sid, q in info["subs"].items():     # 1 consulta, 1 cópia por subscritor
+                    s = self.subs.get(sid)
+                    if s is None:
+                        continue
+                    seq, s["tx"] = s["tx"], wire.seq_next(s["tx"])  # tx_seq por subscritor, com volta
+                    pkt = wire.enc_data(min(q, qos_flow), seq, msg_id, topic, content)
+                    queue = self.retransmit.setdefault(s["addr"], {})
+                    if not queue:
+                        s["last_seen"] = time.time()
+                    queue[seq] = {"pkt": pkt, "last": time.time()}
+                    targets.append((s["addr"], min(q, qos_flow), seq, pkt))
         try:
             self.udp.sendto(wire.enc_udp_ack(tx_seq), addr)
         except OSError:
             pass
+        if duplicate:
+            return
         for dest, qos, tx, pkt in targets:
             try:
                 self.udp.sendto(pkt, dest)
