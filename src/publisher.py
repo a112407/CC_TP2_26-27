@@ -33,6 +33,7 @@ def run_publisher(cfg, ident):
     lock = threading.Lock()
     stop = threading.Event()
 
+    #recebe ACKs do broker e retira da tabela de pendentes
     def ack_loop():
         udp.settimeout(0.2)
         while not stop.is_set():

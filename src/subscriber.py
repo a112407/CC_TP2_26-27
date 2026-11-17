@@ -6,6 +6,7 @@ from logutil import DeliveryLog
 def run_subscriber(cfg, ident):
     t_start = time.time()
     host, port = cfg.get_addr("broker_control")
+    # a escrita do log usa <timestamp_ms> <id> <topic> <message_id>
     log = DeliveryLog(cfg.get("log"), ident)
     duration = cfg.get_float("duration")
 

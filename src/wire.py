@@ -48,7 +48,7 @@ def be(value, n):
 def rd(buf, off, n):
     return int.from_bytes(buf[off:off + n], "big")
 
-
+# comprimento do payload tem que ser 2B
 def enc_frame(mtype, payload=b"", qos=0):
     if len(payload) > MAX_PAYLOAD:
         raise ValueError("payload demasiado grande")
