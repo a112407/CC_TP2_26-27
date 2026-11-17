@@ -5,8 +5,15 @@ biblioteca padrão; os formatos são os de src/wire.py, reescritos aqui de
 propósito: a captura é verificada independentemente do código que a produziu.
 
     tcpdump -i <iface> -nn -s0 -w L1.pcap 'tcp port 7310 or udp'
-    pcap_fase1.py L1.pcap --control-port 7310 [--expect-count sub3=0 ...]
+    analyze_pcap.py L1.pcap --control-port 7310 [--expect-count sub3=0 ...]
                           [--expect-qos sub1/north/station7/humidity=2 ...]
+                          [--min-inflight N] [--expect-retx]
+                          [--evict-after S --evicted sub1 [--tol 1.0]]
+
+Critérios sempre avaliados: S1-S6 (sessão, porta, cabeçalhos, cópia única, qos) e
+Q1-Q4 (números de sequência: tx_seq e msg_id arrancam em 0 e crescem de 1 em 1).
+Opcionais: Q5 pipelining (--min-inflight), Q6 retransmissão concorrente com o envio
+(--expect-retx), E1-E3 expulsão (--evict-after/--evicted).
 
 Capturem com tcpdump (formato pcap). Se usaram o Wireshark (pcapng):
     editcap -F pcap in.pcapng out.pcap
@@ -156,7 +163,8 @@ def dec_dgram(pl):
     return None
 
 
-def analyse(path, cport, expect_count=(), expect_qos=()):
+def analyse(path, cport, expect_count=(), expect_qos=(), min_inflight=0, expect_retx=False,
+            evict_after=None, evicted=None, tol=1.0):
     clients, broker_ip = sessions(path, cport)
     out, ok_all = [], True
 
@@ -175,8 +183,13 @@ def analyse(path, cport, expect_count=(), expect_qos=()):
     deliveries = collections.defaultdict(list)         # id do subscritor -> [(ts, qos, tx, msg, topico)]
     pubs_data = collections.defaultdict(list)
     n_ack = n_bad = n_other = n_wrong = 0
+    fins = []                                          # FIN/RST do broker: (ts, ip, porta do cliente)
+    pub_acks = collections.defaultdict(dict)           # id publicador -> {tx_seq: ts do 1.º ACK}
+    cli_acks = collections.defaultdict(list)           # id subscritor -> [ts dos ACK de entrega]
     for ts, pr, s, sp, d, dp, fl, seq, pl in segments(path):
-        if pr != "udp":
+        if pr == "tcp":
+            if sp == cport and fl & 0x05:
+                fins.append((ts, d, dp))
             continue
         src, dst = (s, sp), (d, dp)
         cli = by_ep.get(src) or by_ep.get(dst)
@@ -193,6 +206,10 @@ def analyse(path, cport, expect_count=(), expect_qos=()):
             n_bad += 1
         elif m[0] == "ACK":
             n_ack += 1
+            if src in bep:
+                pub_acks[cli.id].setdefault(m[1], ts)
+            else:
+                cli_acks[cli.id].append(ts)
         elif src in bep:                               # entrega do broker
             deliveries[cli.id].append((ts,) + m[1:])
         else:                                          # publicação do cliente
@@ -229,12 +246,16 @@ def analyse(path, cport, expect_count=(), expect_qos=()):
           "%d DATA, %d ACK, %d malformados, %d UDP fora do sistema ignorados" % (total, n_ack, n_bad, n_other))
     # S5 cópia única: um datagrama por (subscritor, publicação) na rede
     for cid, dl in sorted(deliveries.items()):
-        mult = collections.Counter((t, m) for _, q, tx, m, t in dl)
-        rep = sum(c - 1 for c in mult.values() if c > 1)
-        retx = sum(c - 1 for c in collections.Counter(tx for _, q, tx, m, t in dl).values() if c > 1)
-        check("S5 %s uma cópia por publicação" % cid, rep == 0,
-              "%d DATA, %d publicações distintas, %d repetidas (%d retransmissões por tx_seq)"
-              % (len(dl), len(mult), rep, retx))
+        # cópia única: um só tx_seq por (tópico, msg). Repetir o MESMO tx_seq é retransmissão
+        # (fiabilidade, permitido); um tx_seq novo para a mesma publicação é uma 2.ª cópia.
+        txs = collections.defaultdict(set)
+        for _, q, tx, m, t in dl:
+            txs[(t, m)].add(tx)
+        copias = sum(len(v) - 1 for v in txs.values())
+        retx = len(dl) - sum(len(v) for v in txs.values())
+        check("S5 %s uma cópia por publicação" % cid, copias == 0,
+              "%d DATA, %d publicações distintas, %d retransmissões (mesmo tx_seq), %d 2.ªs cópias (tx_seq novo)"
+              % (len(dl), len(txs), retx, copias))
     # S6 qos efetivo por (subscritor, tópico)
     qos = collections.defaultdict(set)
     for cid, dl in deliveries.items():
@@ -253,6 +274,59 @@ def analyse(path, cport, expect_count=(), expect_qos=()):
         cid, topic = left.split("/", 1)
         check("E qos efetivo de %s em %s = %s" % (cid, topic, q),
               qos.get((cid, topic)) == {int(q)}, "observado %s" % sorted(qos.get((cid, topic), [])))
+    # Q: números de sequência (tx_seq e msg_id) e fiabilidade, por troço
+    def seq_checks(label, dl, publisher_id=None):
+        first, ident, order, mids, retx_ts, new_ts, same = {}, {}, [], collections.defaultdict(list), [], [], True
+        for ts, q, tx, m, t in dl:
+            if tx in first:
+                retx_ts.append(ts)
+                same &= ident[tx] == (m, t)
+            else:
+                first[tx], ident[tx] = ts, (m, t)
+                order.append(tx); new_ts.append(ts); mids[t].append(m)
+        check("Q1 %s 1.º tx_seq == 0" % label, order[0] == 0, "1.º = %d" % order[0])
+        check("Q2 %s tx_seq novos consecutivos (+1)" % label,
+              order == list(range(order[0], order[0] + len(order))), "%d distintos" % len(order))
+        check("Q3 %s retransmissão repete o mesmo msg_id" % label, same, "%d retransmissões" % len(retx_ts))
+        if publisher_id is None:
+            return
+        for t, l in sorted(mids.items()):
+            check("Q4 %s msg_id de %s: 1.º == 0 e consecutivos" % (label, t),
+                  sorted(l) == list(range(len(l))), "%d ids" % len(l))
+        acked = pub_acks[publisher_id]
+        evs = sorted([(first[t], 1) for t in first] + [(acked[t], -1) for t in first if t in acked])
+        cur = mx = 0
+        for _, dlt in evs:
+            cur += dlt
+            mx = max(mx, cur)
+        if min_inflight:
+            check("Q5 %s pipelining (máx. DATA por confirmar em simultâneo)" % label, mx >= min_inflight,
+                  "máx = %d (mínimo %d)" % (mx, min_inflight))
+        else:
+            out.append("  [info] Q5 %s máx. DATA por confirmar em simultâneo = %d" % (label, mx))
+        if expect_retx:
+            inter = [t for t in retx_ts if t < new_ts[-1]]
+            check("Q6 %s retransmissões concorrentes com o envio de novos" % label, bool(inter),
+                  "%d de %d retransmissões antes do último envio novo" % (len(inter), len(retx_ts)))
+
+    for cid, dl in sorted(pubs_data.items()):
+        seq_checks("%s->broker" % cid, dl, publisher_id=cid)
+    for cid, dl in sorted(deliveries.items()):
+        seq_checks("broker->%s" % cid, dl)
+
+    if evicted:
+        c = next((c for c in clients if c.id == evicted), None)
+        check("E0 sessão %s existe na captura" % evicted, c is not None, "")
+        if c is not None:
+            tf = min((t for t, ip, p in fins if (ip, p) == (c.ip, c.port)), default=None)
+            acks = [t for t in cli_acks[c.id] if tf is None or t <= tf]
+            check("E1 broker fechou a sessão TCP de %s" % evicted, tf is not None, "FIN/RST em t=%s" % tf)
+            if tf is not None and acks:
+                gap = tf - max(acks)
+                check("E2 fecho entre evict_after e evict_after+tol", evict_after <= gap <= evict_after + tol,
+                      "%.2f s após o último ACK (evict_after=%s)" % (gap, evict_after))
+                late = [t for t, *_ in deliveries[c.id] if t > tf + 0.5]
+                check("E3 sem DATA para %s depois do fecho" % evicted, not late, "%d datagramas tardios" % len(late))
     print("\n".join(out))
     print("RESULTADO: %s" % ("ACEITE" if ok_all else "REJEITADO"))
     return 0 if ok_all else 1
@@ -264,5 +338,13 @@ if __name__ == "__main__":
     ap.add_argument("--control-port", type=int, required=True)
     ap.add_argument("--expect-count", action="append", default=[], metavar="ID=N")
     ap.add_argument("--expect-qos", action="append", default=[], metavar="ID/TOPICO=Q")
+    ap.add_argument("--min-inflight", type=int, default=0, help="Q5: mínimo de DATA em trânsito")
+    ap.add_argument("--expect-retx", action="store_true", help="Q6: exige retransmissões durante o envio")
+    ap.add_argument("--evict-after", type=float, help="E2: evict_after do broker (s)")
+    ap.add_argument("--evicted", metavar="ID", help="E1-E3: subscritor que deve ser expulso")
+    ap.add_argument("--tol", type=float, default=1.0, help="E2: tolerância (s)")
     a = ap.parse_args()
-    sys.exit(analyse(a.pcap, a.control_port, a.expect_count, a.expect_qos))
+    if a.evicted and a.evict_after is None:
+        ap.error("--evicted exige --evict-after")
+    sys.exit(analyse(a.pcap, a.control_port, a.expect_count, a.expect_qos, a.min_inflight,
+                     a.expect_retx, a.evict_after, a.evicted, a.tol))

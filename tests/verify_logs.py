@@ -4,7 +4,7 @@
 Confronta o registo de UM subscritor com o(s) registo(s) dos publicadores e
 avalia seis critérios de aceitação. Termina com código 0 se todos passam.
 
-    verify_fase1.py --pub pub1.log [--pub pub2.log ...] --sub sub1.log --sub-id sub1
+    verify_logs.py --pub pub1.log [--pub pub2.log ...] --sub sub1.log --sub-id sub1
                     [--filter 'north/*' ...] [--allow-duplicates]
 
 --filter  filtros do subscritor, tal como na sua configuração (sem eles, espera-se
