@@ -4,6 +4,8 @@ def valid_topic(t):
 
 
 def valid_filter(f):
+    # Um filtro pode ser um tópico exato ou terminar em /* para apanhar
+    # todos os tópicos de uma região ou de uma estação.
     if valid_topic(f):
         return True
     if f.endswith("/*"):
@@ -14,12 +16,14 @@ def valid_filter(f):
 
 def matches(flt, topic):
     if flt.endswith("/*"):
-        return topic.startswith(flt[:-1])  # mantém a '/'
+        # Tirar só o '*' mantém a '/' e evita confundir "norte/a" com
+        # "norte/ab".
+        return topic.startswith(flt[:-1])
     return flt == topic
 
 
 def candidate_filters(topic):
-    """Os únicos 3 filtros que podem corresponder a 'regiao/estacao/metrica'
-    (profundidade fixa): o tópico, 'regiao/estacao/*' e 'regiao/*'."""
+    # Como os tópicos têm profundidade fixa, só estes três filtros podem
+    # corresponder: o exato, a estação inteira ou a região inteira.
     r, e, _ = topic.split("/")
     return (topic, "%s/%s/*" % (r, e), "%s/*" % r)

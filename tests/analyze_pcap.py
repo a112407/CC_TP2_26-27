@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
-"""Análise de uma captura (.pcap) do sistema: descodifica o SubControl (TCP) e o
-EventCast (UDP) a partir dos bytes e verifica requisitos do enunciado. Só
-biblioteca padrão; os formatos são os de src/wire.py, reescritos aqui de
-propósito: a captura é verificada independentemente do código que a produziu.
 
-    tcpdump -i <iface> -nn -s0 -w L1.pcap 'tcp port 7310 or udp'
-    analyze_pcap.py L1.pcap --control-port 7310 [--expect-count sub3=0 ...]
-                          [--expect-qos sub1/north/station7/humidity=2 ...]
-                          [--min-inflight N] [--expect-retx]
-                          [--evict-after S --evicted sub1 [--tol 1.0]]
-
-Critérios sempre avaliados: S1-S6 (sessão, porta, cabeçalhos, cópia única, qos) e
-Q1-Q4 (números de sequência: tx_seq e msg_id arrancam em 0 e crescem de 1 em 1).
-Opcionais: Q5 pipelining (--min-inflight), Q6 retransmissão concorrente com o envio
-(--expect-retx), E1-E3 expulsão (--evict-after/--evicted).
-
-Capturem com tcpdump (formato pcap). Se usaram o Wireshark (pcapng):
-    editcap -F pcap in.pcapng out.pcap
-"""
 import argparse, collections, struct, sys
 
 CTRL = {1: "REG", 2: "SUB", 3: "UNSUB", 4: "HELLO", 5: "WELCOME", 6: "ACK", 7: "BYE"}
@@ -25,7 +7,7 @@ ROLE = {1: "publicador", 2: "subscritor", 3: "broker"}
 BE = lambda b: int.from_bytes(b, "big")
 
 
-# ---------------------------------------------------------------- pcap -> segmentos
+# pcap -> segmentos
 def read_pcap(path):
     with open(path, "rb") as f:
         d = f.read()
@@ -47,7 +29,7 @@ def read_pcap(path):
 
 
 def ip_of(link, fr):
-    """Extrai o pacote IPv4 de uma trama (Ethernet, Linux cooked v1/v2, IP cru)."""
+    # Extrai o pacote IPv4 de uma trama 
     if link == 1:
         et, off = BE(fr[12:14]), 14
         while et in (0x8100, 0x88A8):
@@ -63,7 +45,6 @@ def ip_of(link, fr):
 
 
 def segments(path):
-    """(ts, proto, src, sport, dst, dport, flags, seq, payload)"""
     for ts, link, fr in read_pcap(path):
         ip = ip_of(link, fr)
         if not ip or len(ip) < 20:
@@ -80,11 +61,8 @@ def segments(path):
             yield ts, "udp", src, BE(seg[0:2]), dst, BE(seg[2:4]), 0, 0, seg[8:BE(seg[4:6])]
 
 
-# ---------------------------------------------------------------- SubControl
+# SubControl
 def frames(pkts):
-    """Reconstrói a stream (por número de sequência TCP) e delimita as mensagens
-    SubControl: 4 B de cabeçalho (Tam. Msg 2 B só do payload | Tipo | QoS) + payload.
-    Devolve [(ts, tipo, qos, payload)], com o ts do pacote que completou a mensagem."""
     buf, marks, nxt = bytearray(), [], None
     for seq, ts, pl in sorted(pkts, key=lambda x: (x[0], x[1])):
         if not pl:
@@ -150,7 +128,7 @@ def sessions(path, cport):
     return clients, broker_ip
 
 
-# ---------------------------------------------------------------- EventCast
+# EventCast
 def dec_dgram(pl):
     """('DATA', qos, tx_seq, msg_id, topico) | ('ACK', tx_seq) | None se malformado"""
     if pl[:1] == b"\x01" and len(pl) >= 11 and len(pl) >= 11 + pl[10]:
@@ -221,6 +199,7 @@ def analyse(path, cport, expect_count=(), expect_qos=(), min_inflight=0, expect_
                    % (c.id, ROLE.get(c.role, c.role), c.ip, c.port, c.udp_port, c.data_port,
                       ", ".join("%s %s" % (CTRL[t], x) for t, x, *_ in c.cmds) or "-"))
     out.append("Critérios:")
+    
     # S1 a sessão SubControl precede o primeiro datagrama de cada cliente
     for c in clients:
         if c.first_udp is None:
@@ -230,6 +209,7 @@ def analyse(path, cport, expect_count=(), expect_qos=(), min_inflight=0, expect_
                   c.t_welcome is not None and c.t_welcome < c.first_udp,
                   "WELCOME em t=%.6f, 1.º UDP em t=%.6f (+%.3f ms)"
                   % (c.t_welcome or 0, c.first_udp, 1000 * (c.first_udp - (c.t_welcome or 0))))
+    
     # S2 um subscritor só recebe depois do ACK da sua primeira subscrição
     for c in clients:
         if c.role == 2 and c.first_udp is not None:
@@ -237,16 +217,19 @@ def analyse(path, cport, expect_count=(), expect_qos=(), min_inflight=0, expect_
             check("S2 %s primeira entrega depois do ACK do SUB" % c.id,
                   t_ack is not None and c.first_udp > t_ack,
                   "ACK do SUB em t=%.6f, 1.ª entrega em t=%.6f" % (t_ack or 0, c.first_udp))
-    # S3 a porta de dados usada é a anunciada no WELCOME (não fixa no código)
+    
+    # S3 a porta de dados usada é a anunciada no WELCOME 
     check("S3 porta de dados usada = a anunciada no WELCOME", len(bports) == 1 and n_wrong == 0,
           "WELCOME anuncia %s; %d datagramas dos clientes para outros destinos" % (sorted(bports), n_wrong))
+    
     # S4 cabeçalhos EventCast bem formados
     total = sum(len(v) for v in deliveries.values()) + sum(len(v) for v in pubs_data.values())
     check("S4 cabeçalhos EventCast bem formados", n_bad == 0,
           "%d DATA, %d ACK, %d malformados, %d UDP fora do sistema ignorados" % (total, n_ack, n_bad, n_other))
+    
     # S5 cópia única: um datagrama por (subscritor, publicação) na rede
     for cid, dl in sorted(deliveries.items()):
-        # cópia única: um só tx_seq por (tópico, msg). Repetir o MESMO tx_seq é retransmissão
+        # cópia única: um só tx_seq por (tópico, msg). Repetir o mesmo tx_seq é retransmissão
         # (fiabilidade, permitido); um tx_seq novo para a mesma publicação é uma 2.ª cópia.
         txs = collections.defaultdict(set)
         for _, q, tx, m, t in dl:
@@ -256,6 +239,7 @@ def analyse(path, cport, expect_count=(), expect_qos=(), min_inflight=0, expect_
         check("S5 %s uma cópia por publicação" % cid, copias == 0,
               "%d DATA, %d publicações distintas, %d retransmissões (mesmo tx_seq), %d 2.ªs cópias (tx_seq novo)"
               % (len(dl), len(txs), retx, copias))
+    
     # S6 qos efetivo por (subscritor, tópico)
     qos = collections.defaultdict(set)
     for cid, dl in deliveries.items():
@@ -274,7 +258,8 @@ def analyse(path, cport, expect_count=(), expect_qos=(), min_inflight=0, expect_
         cid, topic = left.split("/", 1)
         check("E qos efetivo de %s em %s = %s" % (cid, topic, q),
               qos.get((cid, topic)) == {int(q)}, "observado %s" % sorted(qos.get((cid, topic), [])))
-    # Q: números de sequência (tx_seq e msg_id) e fiabilidade, por troço
+    
+    # Q: números de sequência (tx_seq e msg_id) e fiabilidade
     def seq_checks(label, dl, publisher_id=None):
         first, ident, order, mids, retx_ts, new_ts, same = {}, {}, [], collections.defaultdict(list), [], [], True
         for ts, q, tx, m, t in dl:

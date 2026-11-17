@@ -6,7 +6,6 @@ from logutil import DeliveryLog
 def run_subscriber(cfg, ident):
     t_start = time.time()
     host, port = cfg.get_addr("broker_control")
-    # a escrita do log usa <timestamp_ms> <id> <topic> <message_id>
     log = DeliveryLog(cfg.get("log"), ident)
     duration = cfg.get_float("duration")
 
@@ -20,8 +19,9 @@ def run_subscriber(cfg, ident):
     if m is None or m[0] != wire.T_WELCOME:
         raise SystemExit("sessão recusada")
     data_port, _ = wire.dec_welcome(m[2])
-    # Destino dos ACKs EventCast (fase 2). Têm de sair do mesmo socket 'udp',
-    # cuja porta o broker guardou no HELLO.
+
+    # Os ACKs têm de sair pelo mesmo socket UDP que foi anunciado no HELLO.
+    # É assim que o broker sabe a que subscritor pertencem.
     broker_data = (host, data_port)
 
     stop = threading.Event()
@@ -41,24 +41,27 @@ def run_subscriber(cfg, ident):
                 udp.sendto(wire.enc_udp_ack(tx), broker_data)
             except OSError:
                 pass
-            # fase 3: se qos == 2, consultar tabela de duplicados aqui,
-            # com chave (topic, mid): o mid sozinho colide entre fluxos.
+
+            # O log regista cada entrega recebida, incluindo repetições.
+            # A deduplicação de QoS 2, se for necessária, tem de usar
+            # (topic, mid), porque o mid sozinho pode repetir-se noutro fluxo.
             log.write(topic, mid)
 
     threading.Thread(target=recv_loop, daemon=True).start()
 
-    session_ok = True   # passa a False se o broker fechar a sessão (ex.: expulsão)
+    # A receção UDP continua até ao fim da duração, mesmo que o TCP caia.
+    session_ok = True
 
     def control(frame, what):
-        """Pedido SubControl com resposta. Devolve True se aceite. Se a sessão
-        caiu, deixa de tentar (o registo e a receção continuam até 'duration')."""
+        # Cada comando TCP espera um ACK. Depois de a sessão cair, não vale a
+        # pena continuar a enviar comandos, mas ainda podemos receber UDP.
         nonlocal session_ok
         if not session_ok:
             return False
         try:
             tcp.sendall(frame)
             r = rdr.read()
-        except OSError:        # BrokenPipeError, ConnectionResetError, ...
+        except OSError:
             r = None
         if r is None:
             session_ok = False
@@ -79,7 +82,9 @@ def run_subscriber(cfg, ident):
     for flt, o in cfg.all("subscribe"):
         subscribe(flt, int(o["qos"]))
 
-    actions = []  # ações 'at', relativas ao arranque do processo
+    # As ações são guardadas e ordenadas porque podem aparecer fora de ordem
+    # no ficheiro de configuração.
+    actions = []
     for at, o in cfg.all("at"):
         if "subscribe" in o:
             actions.append((float(at), "sub", o["subscribe"], int(o["qos"])))
@@ -92,6 +97,8 @@ def run_subscriber(cfg, ident):
             time.sleep(wait)
         subscribe(flt, qos) if kind == "sub" else unsubscribe(flt)
 
+    # Mantemos o processo vivo até à duração configurada para continuar
+    # a receber mensagens que possam chegar entretanto.
     rest = t_start + duration - time.time()
     if rest > 0:
         time.sleep(rest)

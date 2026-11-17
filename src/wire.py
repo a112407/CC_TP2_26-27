@@ -1,40 +1,17 @@
-"""Formatos binários dos dois protocolos (big-endian, byte a byte com
-int.to_bytes / int.from_bytes; sem struct/JSON).
-
-SubControl (TCP), conforme o desenho da aula:
-    | Tam. Msg (2B) | Tipo Comando (1B) | QoS (1B) | Payload (Tam. Msg bytes) |
-    Tam. Msg = nº de bytes do payload (cabeçalho fixo de 4 B não conta).
-    Tipo: 1=REG  2=SUB  3=UNSUB  4=HELLO  5=WELCOME  6=ACK  7=BYE
-    QoS : 0 = não se aplica; 1 = G1 (at-least-once); 2 = G2 (exactly-once)
-
-EventCast (UDP):
-    DATA (tipo 1): | tipo 1B | qos 1B | tx_seq 4B | msg_id 4B | topic_len 1B | topico | dados |
-    ACK  (tipo 2): | tipo 1B | tx_seq 4B |          (reservado; mecanismo na fase 2)
-
-    tx_seq: número de sequência POR EMISSOR E POR SALTO (32 bits, sem valor
-    reservado; dá a volta, ver seq_next/seq_lt). msg_id: ponta a ponta.
-"""
-
-# ---- Números de sequência de 32 bits (aritmética modular) ----
 SEQ_MOD = 1 << 32
 SEQ_MASK = SEQ_MOD - 1
 RTO = 0.25
 
 
 def seq_next(n):
-    """Próximo número de sequência. Dá a volta aos 2**32 sem reservar o 0."""
     return (n + 1) & SEQ_MASK
 
 
 def seq_lt(a, b):
-    """a é anterior a b? Aritmética de números de série (RFC 1982): a distância
-    a->b, módulo 2**32, tem de ser positiva e menor que metade do espaço.
-    Só é válido enquanto a janela em trânsito for menor que 2**31."""
     d = (b - a) & SEQ_MASK
     return d != 0 and d < (SEQ_MOD >> 1)
 
 
-# ---- SubControl ----
 T_REG, T_SUB, T_UNSUB, T_HELLO, T_WELCOME, T_ACK, T_BYE = 1, 2, 3, 4, 5, 6, 7
 ROLE_PUB, ROLE_SUB, ROLE_BROKER = 1, 2, 3
 CTRL_HEAD = 4
@@ -48,7 +25,6 @@ def be(value, n):
 def rd(buf, off, n):
     return int.from_bytes(buf[off:off + n], "big")
 
-# comprimento do payload tem que ser 2B
 def enc_frame(mtype, payload=b"", qos=0):
     if len(payload) > MAX_PAYLOAD:
         raise ValueError("payload demasiado grande")
@@ -56,8 +32,7 @@ def enc_frame(mtype, payload=b"", qos=0):
 
 
 class FrameReader:
-    """Delimitação sobre a stream TCP: 4 bytes de cabeçalho, depois Tam. Msg
-    bytes. Devolve (tipo, qos, payload), ou None se o par fechou."""
+    # Lê uma mensagem TCP inteira, mesmo que chegue dividida em vários recv.
 
     def __init__(self, sock):
         self.sock = sock
@@ -87,7 +62,6 @@ def enc_hello(role, udp_port, ident):
 
 
 def dec_hello(p):
-    """(role, porta UDP, id). ValueError se truncado ou com id não UTF-8."""
     if len(p) < 4 or len(p) < 4 + p[3]:
         raise ValueError("HELLO truncado")
     return p[0], rd(p, 1, 2), p[4:4 + p[3]].decode()
@@ -101,7 +75,7 @@ def dec_welcome(p):
     return rd(p, 0, 2), rd(p, 2, 4)
 
 
-def enc_reg(topic, qos):          # publicador regista um fluxo
+def enc_reg(topic, qos):
     return enc_frame(T_REG, topic.encode(), qos)
 
 
@@ -113,11 +87,10 @@ def enc_unsub(flt):
     return enc_frame(T_UNSUB, flt.encode())
 
 
-def enc_ack(status=0):            # 0 = ok
+def enc_ack(status=0):
     return enc_frame(T_ACK, be(status, 1))
 
 
-# ---- EventCast ----
 E_DATA, E_ACK = 1, 2
 DATA_FIXED = 11
 
@@ -129,7 +102,6 @@ def enc_data(qos, tx_seq, msg_id, topic, content=b""):
 
 
 def dec_data(d):
-    """(qos, tx_seq, msg_id, topic, content) ou None se truncado/inválido."""
     if len(d) < DATA_FIXED or d[0] != E_DATA:
         return None
     tl = d[10]
@@ -138,7 +110,8 @@ def dec_data(d):
     try:
         topic = d[11:11 + tl].decode()
     except UnicodeDecodeError:
-        return None  # descarte silencioso, como os truncados
+        # Um pacote com texto inválido é tratado como um pacote truncado.
+        return None
     return d[1], rd(d, 2, 4), rd(d, 6, 4), topic, d[11 + tl:]
 
 

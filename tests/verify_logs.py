@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""Verificação formal dos registos (secção 5.2 do enunciado). Só biblioteca padrão.
 
-Confronta o registo de UM subscritor com o(s) registo(s) dos publicadores e
-avalia seis critérios de aceitação. Termina com código 0 se todos passam.
-
-    verify_logs.py --pub pub1.log [--pub pub2.log ...] --sub sub1.log --sub-id sub1
-                    [--filter 'north/*' ...] [--allow-duplicates]
-
---filter  filtros do subscritor, tal como na sua configuração (sem eles, espera-se
-          tudo o que foi publicado). A correspondência usa src/topics.py, a mesma
-          regra do broker, o que testa também a cópia única (secção 3.4).
-"""
 import argparse, os, re, statistics, sys, time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
@@ -37,7 +26,6 @@ def load(path):
 
 
 def verify(pub_logs, sub_log, sub_id, filters=(), allow_dups=False, max_age_h=24, now_ms=None):
-    """Lista de (criterio, passou, detalhe)."""
     now_ms = now_ms or int(time.time() * 1000)
     res = []
     pubs = [(p,) + load(p) for p in pub_logs]

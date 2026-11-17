@@ -12,25 +12,32 @@ class Broker:
         self.duration = cfg.get_float("duration")
         self.evict_after = cfg.get_float("evict_after")
         self.lock = threading.Lock()
-        # Tabela 1 do desenho: filtro -> {session_id: qos}  ("Tópico | Inscritos")
+
+        # Aqui ficam as subscrições tal como foram recebidas:
+        # filtro -> {id_da_sessao: qos}.
         self.table = {}
-        # Tabela 2 do desenho: informação do tópico + subscritores ATIVOS.
-        # topico -> {"qos": qos do fluxo (REG), "pub": id do publicador,
-        #            "subs": {session_id: qos mais forte dos filtros que o cobrem}}
-        # É a tabela 1 já resolvida para tópicos concretos: na publicação basta 1 consulta.
+
+        # Nos tópicos guardamos também os subscritores já resolvidos.
+        # Assim, quando chega uma mensagem, não temos de voltar a procurar
+        # todos os filtros possíveis.
         self.topics = {}
-        # Estado por sessão (um dicionário por papel):
-        #   {addr: (IP do TCP, porta UDP do HELLO), tx: último tx_seq, id, conn}
-        self.subs = {}      # session_id -> subscritor
-        self.pubs = {}      # session_id -> publicador
-        # Associa a origem de um datagrama UDP à sessão que a anunciou no HELLO.
-        # Serve para aceitar DATA só de publicadores com sessão e, na fase 2,
-        # para ligar cada ACK UDP ao emissor.
-        self.by_addr = {}   # (ip, porta UDP) -> session_id
+
+        # Estado separado para publicadores e subscritores.
+        self.subs = {}
+        self.pubs = {}
+
+        # O UDP não tem sessão. Este mapa diz-nos a que sessão pertence
+        # cada endereço UDP anunciado no HELLO.
+        self.by_addr = {}
         self.next_session = 1
         self.stop = threading.Event()
-        self.retransmit = {}  # dest -> {tx_seq: {"pkt": pacote, "last": ts}}
-        self.dup_seen = {}     # (sid_pub, tx_seq) -> ts: deduplicação de DATA retransmitidos
+
+        # Para cada subscritor, guardamos os pacotes que ainda não tiveram ACK.
+        self.retransmit = {}
+
+        # Um DATA retransmitido pelo publicador não deve ser entregue duas vezes.
+        # A chave usa a sessão e o tx_seq, porque o msg_id pode repetir-se.
+        self.dup_seen = {}
 
     def warn(self, msg):
         print("[broker %s] %s" % (self.ident, msg), file=sys.stderr, flush=True)
@@ -87,7 +94,7 @@ class Broker:
                 except OSError:
                     pass
 
-    # ---------- plano de controlo ----------
+    # Primeiro tratamos as ligações TCP e os comandos de controlo.
     def accept_loop(self):
         while not self.stop.is_set():
             try:
@@ -109,7 +116,6 @@ class Broker:
             if first is None or first[0] != wire.T_HELLO:
                 return
             role, udp_port, cid = wire.dec_hello(first[2])
-            # ROLE_BROKER só na fase 4; porta UDP 0 não é endereçável.
             if role not in (wire.ROLE_PUB, wire.ROLE_SUB) or udp_port == 0:
                 return
             udp_addr = (addr[0], udp_port)
@@ -119,6 +125,9 @@ class Broker:
                 st = {"addr": udp_addr, "tx": 0, "id": cid, "conn": conn, "last_seen": time.time()}
                 (self.subs if role == wire.ROLE_SUB else self.pubs)[sid] = st
                 self.by_addr[udp_addr] = sid
+
+            # A partir daqui o cliente já sabe em que porta UDP deve falar
+            # com o broker e nós conseguimos validar a origem dos datagramas.
             conn.sendall(wire.enc_welcome(self.data_port, sid))
             while True:
                 m = rdr.read()
@@ -126,9 +135,9 @@ class Broker:
                     break
                 mtype, qos, payload = m
                 text = payload.decode(errors="replace")
-                # Regra do SubControl: TODO o comando recebe uma resposta.
-                # Por omissão é recusado (tipo desconhecido, comando que não
-                # pertence ao papel da sessão, argumentos inválidos).
+
+                # Começamos por recusar. Só damos OK quando o comando faz
+                # sentido para o papel da sessão e os argumentos são válidos.
                 status = 1
                 if mtype == wire.T_REG and role == wire.ROLE_PUB:
                     if valid_topic(text) and qos in (1, 2):
@@ -153,9 +162,11 @@ class Broker:
         finally:
             if sid is not None:
                 with self.lock:
+                    # Fechar a ligação também cancela as subscrições e limpa os
+                    # pacotes pendentes dessa sessão.
                     for f in list(self.table):
                         self._drop(f, sid)
-                    self._refresh()          # deixa de ser subscritor ativo
+                    self._refresh()
                     self.subs.pop(sid, None)
                     self.pubs.pop(sid, None)
                     if udp_addr is not None:
@@ -167,14 +178,17 @@ class Broker:
             except OSError:
                 pass
 
-    def _drop(self, flt, sid):  # chamar com o lock
+    def _drop(self, flt, sid):
+        # Este método é chamado com self.lock já adquirido.
         inscritos = self.table.get(flt)
         if inscritos is not None:
             inscritos.pop(sid, None)
             if not inscritos:
                 del self.table[flt]
 
-    def _evict_subscriber(self, sid):  # chamar com o lock
+    def _evict_subscriber(self, sid):
+        # Se um subscritor deixa de responder, removêmo-lo para não ficarmos
+        # a retransmitir para sempre.
         st = self.subs.get(sid)
         if st is None:
             return
@@ -195,19 +209,17 @@ class Broker:
         except OSError:
             pass
 
-    def _resolve(self, topic):  # chamar com o lock
-        """Subscritores que cobrem um tópico concreto: 3 consultas à tabela 1;
-        com filtros sobrepostos fica o qos mais forte."""
+    def _resolve(self, topic):
+        # Um subscritor pode aparecer em mais do que um filtro. Nesse caso,
+        # fica com o QoS mais forte entre os filtros que correspondem.
         best = {}
         for f in candidate_filters(topic):
             for sid, q in self.table.get(f, {}).items():
                 best[sid] = max(best.get(sid, 0), q)
         return best
 
-    def _refresh(self, flt=None):  # chamar com o lock
-        """Recalcula os subscritores dos tópicos registados afetados por 'flt'
-        (ou de todos se flt for None). Substitui o dicionário inteiro: quem
-        já copiou a referência nunca vê uma atualização a meio."""
+    def _refresh(self, flt=None):
+        # Recalculamos só os tópicos afetados por uma alteração de filtro.
         for t, info in self.topics.items():
             if flt is None or matches(flt, t):
                 info["subs"] = self._resolve(t)
@@ -224,7 +236,7 @@ class Broker:
         self.dup_seen[key] = now
         return False
 
-    # ---------- plano de dados ----------
+    # Depois do controlo, estas rotinas tratam dos DATA, ACKs e retransmissões.
     def retransmit_loop(self):
         while not self.stop.is_set():
             now = time.time()
@@ -239,6 +251,7 @@ class Broker:
                 try:
                     self.udp.sendto(pkt, dest)
                 except OSError:
+                    # O pacote continua na fila: a próxima volta tenta outra vez.
                     pass
             time.sleep(0.05)
 
@@ -268,25 +281,30 @@ class Broker:
     def on_data(self, data, addr):
         d = wire.dec_data(data)
         if d is None or not valid_topic(d[3]):
-            return  # truncado / desconhecido / tópico inválido: descarta
+            return
         _, tx_seq, msg_id, topic, content = d
         with self.lock:
             sid_pub = self.by_addr.get(addr)
             if sid_pub not in self.pubs:
-                return  # origem sem sessão de publicador: descarta
+                return
+
+            # O ACK do publicador é tratado mesmo quando o DATA é repetido.
+            # O que não fazemos é encaminhar esse DATA outra vez.
             duplicate = self._is_duplicate_pub(sid_pub, tx_seq)
             self.pubs[sid_pub]["last_seen"] = time.time()
             info = self.topics.get(topic)
             if info is None:
-                return  # fluxo não registado (REG): descarta
+                return
             qos_flow = info["qos"]
             targets = []
             if not duplicate:
-                for sid, q in info["subs"].items():     # 1 consulta, 1 cópia por subscritor
+                for sid, q in info["subs"].items():
                     s = self.subs.get(sid)
                     if s is None:
                         continue
-                    seq, s["tx"] = s["tx"], wire.seq_next(s["tx"])  # tx_seq por subscritor, com volta
+                    # Cada salto tem o seu próprio contador de sequência:
+                    # o tx_seq do publicador não é reutilizado para o subscritor.
+                    seq, s["tx"] = s["tx"], wire.seq_next(s["tx"])
                     pkt = wire.enc_data(min(q, qos_flow), seq, msg_id, topic, content)
                     queue = self.retransmit.setdefault(s["addr"], {})
                     if not queue:
@@ -303,6 +321,6 @@ class Broker:
             try:
                 self.udp.sendto(pkt, dest)
             except OSError as e:
-                # ex.: rede inalcançável. Um destino em falha não afeta os
-                # outros; na fase 2 a retransmissão volta a tentar.
+                # Não falhamos a entrega aos outros subscritores por causa
+                # de um destino; a fila fica pronta para a retransmissão.
                 self.warn("sendto %s: %r" % (dest, e))

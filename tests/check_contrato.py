@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
-"""Verificação do contrato de execução (secção 5.2) e das restrições da secção
-3.3. Só biblioteca padrão. Estática (run.sh, código) e dinâmica (executa o broker
-pelo run.sh a partir de outra diretoria).
 
-    python3 tests/check_contrato.py
-"""
 import ast, os, re, signal, socket, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src")
 RUN = os.path.join(ROOT, "run.sh")
-# secção 3.3: serialização, pub/sub e fiabilidade sobre UDP proibidas; struct é
-# proibido por decisão do grupo (int.to_bytes/from_bytes, sem dúvidas)
 PROIBIDOS = {"pickle", "cPickle", "marshal", "shelve", "json", "simplejson", "yaml", "struct",
              "msgpack", "google", "protobuf", "paho", "zmq", "pika", "kafka", "amqp", "enet",
              "twisted", "xmlrpc", "plistlib"}

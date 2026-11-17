@@ -1,12 +1,12 @@
-"""Parser do ficheiro de configuração: 'chave = valor  # comentário'.
-Valor = primeiro termo + opções nome=valor. Sem valores por omissão."""
-
-
 class Config:
     def __init__(self, path):
-        self.items = {}  # chave -> lista de (termo, {opcoes}) pela ordem de aparição
+        # Cada chave pode aparecer mais do que uma vez:
+        # chave -> [(valor_principal, {opcoes})].
+        self.items = {}
         with open(path, "r") as f:
             for raw in f:
+                # Os comentários podem estar no fim da linha, por isso
+                # limpamos essa parte antes de tentar ler a configuração.
                 line = raw.split("#", 1)[0].strip()
                 if not line or "=" not in line:
                     continue
@@ -14,6 +14,9 @@ class Config:
                 tokens = value.split()
                 if not tokens:
                     continue
+
+                # O primeiro termo é o valor principal; os seguintes são
+                # opções no formato nome=valor.
                 opts = {}
                 for tok in tokens[1:]:
                     if "=" in tok:
@@ -22,7 +25,7 @@ class Config:
                 self.items.setdefault(key.strip(), []).append((tokens[0], opts))
 
     def get(self, key):
-        """Chave que aparece exatamente uma vez: devolve o termo (str)."""
+        # Aqui esperamos uma chave única e devolvemos só o valor principal.
         return self.items[key][0][0]
 
     def get_int(self, key):
@@ -32,9 +35,11 @@ class Config:
         return float(self.get(key))
 
     def get_addr(self, key):
+        # Usamos o último ':' para não partir o endereço antes da porta.
         host, port = self.get(key).rsplit(":", 1)
         return host, int(port)
 
     def all(self, key):
-        """Chave que aparece zero ou mais vezes: lista de (termo, opcoes)."""
+        # Para chaves repetidas, devolvemos todos os valores pela ordem
+        # em que aparecem no ficheiro.
         return self.items.get(key, [])

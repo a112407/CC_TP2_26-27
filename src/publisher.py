@@ -3,7 +3,6 @@ import wire
 from logutil import DeliveryLog
 
 
-LINGER = 0.5   # s, espera antes do BYE (ver abaixo)
 ACK_TIMEOUT = wire.RTO
 
 
@@ -23,7 +22,9 @@ def run_publisher(cfg, ident):
     data_port, _ = wire.dec_welcome(m[2])
     broker_data = (host, data_port)
     rdr = wire.FrameReader(tcp)
-    for topic, o in cfg.all("publish"):      # registo de cada fluxo (REG)
+    # Antes de publicar, o broker tem de conhecer todos os fluxos deste
+    # publicador.
+    for topic, o in cfg.all("publish"):
         tcp.sendall(wire.enc_reg(topic, int(o["qos"])))
         r = rdr.read()
         if r is None or r[0] != wire.T_ACK or r[2][0] != 0:
@@ -33,8 +34,9 @@ def run_publisher(cfg, ident):
     lock = threading.Lock()
     stop = threading.Event()
 
-    #recebe ACKs do broker e retira da tabela de pendentes
     def ack_loop():
+        # Cada ACK tira um pacote da fila. Enquanto ele lá estiver,
+        # a outra thread pode voltar a enviá-lo.
         udp.settimeout(0.2)
         while not stop.is_set():
             try:
@@ -48,6 +50,8 @@ def run_publisher(cfg, ident):
                 pending.pop(ack, None)
 
     def resend_loop():
+        # Os pacotes sem ACK ficam pendentes até serem confirmados ou até
+        # acabar o tempo de espera do publicador.
         while not stop.is_set():
             now = time.time()
             with lock:
@@ -70,16 +74,14 @@ def run_publisher(cfg, ident):
     for t in threads:
         t.start()
 
-    # agenda: (instante relativo, topico, qos, msg_id)
+    # A agenda guarda quando cada mensagem deve sair, contado desde o arranque
+    # da publicação.
     sched = []
     for topic, o in cfg.all("publish"):
         count, rate, qos = int(o["count"]), float(o["rate"]), int(o["qos"])
         sched += [(k / rate, topic, qos, k) for k in range(count)]
     sched.sort()
 
-    # tx_seq: contador do PUBLICADOR (um por salto publicador->broker), comum a
-    # todos os fluxos. O msg_id é o identificador ponta a ponta do fluxo, por isso
-    # começa em 0 para coincidir com a primeira publicação válida.
     tx = 0
     time.sleep(start_after)
     t0 = time.time()
@@ -88,9 +90,8 @@ def run_publisher(cfg, ident):
         if wait > 0:
             time.sleep(wait)
         seq, tx = tx, wire.seq_next(tx)
-        # Regista ANTES de enviar: o instante de publicação nunca é posterior ao
-        # de qualquer entrega (o relógio é em ms; registar depois do sendto deixa
-        # o subscritor, noutro processo, registar a entrega 1 ms antes).
+        # Registamos antes do sendto para a publicação nunca aparecer depois
+        # da entrega no log do subscritor (os relógios são guardados em ms).
         log.write(topic, mid)
         pkt = wire.enc_data(qos, seq, mid, topic, b"synthetic")
         with lock:
@@ -98,13 +99,12 @@ def run_publisher(cfg, ident):
         try:
             udp.sendto(pkt, broker_data)
         except OSError as e:
-            # A publicação existe (fica no registo); na fase 2 a retransmissão
-            # volta a enviá-la. Aqui só não deixamos o processo morrer.
+            # A mensagem já ficou registada e continua pendente, por isso
+            # a thread de retransmissão ainda pode tentar enviá-la.
             print("[publisher %s] sendto: %r" % (ident, e), file=sys.stderr, flush=True)
-    # Fase 2: o broker responde com ACK por UDP; se um datagrama não for
-    # confirmado a tempo, o remetente retransmite até o ACK chegar. O publicador
-    # espera até ao máximo de drain segundos, mas termina antes se tudo estiver
-    # confirmado.
+
+    # Damos algum tempo para os ACKs chegarem. Se todos chegaram, podemos
+    # terminar logo; caso contrário, esperamos no máximo o valor de drain.
     deadline = time.time() + drain
     while time.time() < deadline:
         with lock:
