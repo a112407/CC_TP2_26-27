@@ -12,7 +12,7 @@ def run_subscriber(cfg, ident):
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind(("0.0.0.0", 0))
     tcp = socket.create_connection((host, port))
-    tcp.settimeout(1.0)
+    tcp.settimeout(10.0)
     rdr = wire.FrameReader(tcp)
     tcp.sendall(wire.enc_hello(wire.ROLE_SUB, udp.getsockname()[1], ident))
     m = rdr.read()
@@ -25,6 +25,7 @@ def run_subscriber(cfg, ident):
     broker_data = (host, data_port)
 
     stop = threading.Event()
+    seen = set()   # (topic, mid) já registados; só é consultado em qos=2
 
     def recv_loop():
         udp.settimeout(0.2)
@@ -42,9 +43,13 @@ def run_subscriber(cfg, ident):
             except OSError:
                 pass
 
-            # O log regista cada entrega recebida, incluindo repetições.
-            # A deduplicação de QoS 2, se for necessária, tem de usar
-            # (topic, mid), porque o mid sozinho pode repetir-se noutro fluxo.
+            # G1 (qos=1): sem estado, uma repetição fica registada duas vezes.
+            # G2 (qos=2): elimina duplicados. O ACK já foi enviado acima,
+            # por isso o broker pára de retransmitir mesmo para um duplicado.
+            if qos == 2:
+                if (topic, mid) in seen:
+                    continue
+                seen.add((topic, mid))
             log.write(topic, mid)
 
     threading.Thread(target=recv_loop, daemon=True).start()

@@ -35,10 +35,6 @@ class Broker:
         # Para cada subscritor, guardamos os pacotes que ainda não tiveram ACK.
         self.retransmit = {}
 
-        # Um DATA retransmitido pelo publicador não deve ser entregue duas vezes.
-        # A chave usa a sessão e o tx_seq, porque o msg_id pode repetir-se.
-        self.dup_seen = {}
-
     def warn(self, msg):
         print("[broker %s] %s" % (self.ident, msg), file=sys.stderr, flush=True)
 
@@ -155,6 +151,7 @@ class Broker:
                     with self.lock:
                         self._drop(text, sid)
                         self._refresh(text)
+                        self._purge_pending(sid)
                     status = 0
                 conn.sendall(wire.enc_ack(status))
         except (OSError, IndexError, ValueError):
@@ -223,17 +220,30 @@ class Broker:
         for t, info in self.topics.items():
             if flt is None or matches(flt, t):
                 info["subs"] = self._resolve(t)
+    
+    def _purge_pending(self, sid):
+        # Chamado com self.lock. Descarta da fila do subscritor os pacotes
+        # de tópicos que já não lhe correspondem (depois de um UNSUB).
+        st = self.subs.get(sid)
+        if st is None:
+            return
+        pending = self.retransmit.get(st["addr"])
+        if not pending:
+            return
+        for seq, state in list(pending.items()):
+            info = self.topics.get(state["topic"])
+            if info is None or sid not in info["subs"]:
+                del pending[seq]
+        if not pending:
+            del self.retransmit[st["addr"]]
 
     def _is_duplicate_pub(self, sid_pub, tx_seq):
-        now = time.time()
-        window = 2 * wire.RTO
-        for key, ts in list(self.dup_seen.items()):
-            if now - ts > window:
-                del self.dup_seen[key]
-        key = (sid_pub, tx_seq)
-        if key in self.dup_seen:
+        # Chamado com self.lock adquirido. O conjunto vive com a sessão do
+        # publicador (self.pubs) e desaparece quando ela fecha.
+        seen = self.pubs[sid_pub].setdefault("seen", set())
+        if tx_seq in seen:
             return True
-        self.dup_seen[key] = now
+        seen.add(tx_seq)
         return False
 
     # Depois do controlo, estas rotinas tratam dos DATA, ACKs e retransmissões.
@@ -293,11 +303,9 @@ class Broker:
             duplicate = self._is_duplicate_pub(sid_pub, tx_seq)
             self.pubs[sid_pub]["last_seen"] = time.time()
             info = self.topics.get(topic)
-            if info is None:
-                return
-            qos_flow = info["qos"]
             targets = []
-            if not duplicate:
+            if info is not None and not duplicate:
+                qos_flow = info["qos"]
                 for sid, q in info["subs"].items():
                     s = self.subs.get(sid)
                     if s is None:
@@ -309,7 +317,7 @@ class Broker:
                     queue = self.retransmit.setdefault(s["addr"], {})
                     if not queue:
                         s["last_seen"] = time.time()
-                    queue[seq] = {"pkt": pkt, "last": time.time()}
+                    queue[seq] = {"pkt": pkt, "last": time.time(), "topic": topic}
                     targets.append((s["addr"], min(q, qos_flow), seq, pkt))
         try:
             self.udp.sendto(wire.enc_udp_ack(tx_seq), addr)
